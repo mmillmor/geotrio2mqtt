@@ -1,5 +1,7 @@
 # geotrio2mqtt
-ESP firmware to read and publish meter readings from a Geo Trio II IHD
+ESP firmware to read and publish meter readings from a Geo Trio II IHD.
+
+The method below and the included .ino are based on using an ESP8266 NodeMCU because that's what I had on hand. It should work with any similar ESP8266 or ESP32 boards but may require some minor tweaks to the included libraries and the RX pin. Any AI should be able to point out any changes you need for your specific board.
 
 **HARDWARE REQUIREMENTS:**
 - Geo Trio II in-home display (with or without stock WiFi module)
@@ -29,13 +31,23 @@ ESP firmware to read and publish meter readings from a Geo Trio II IHD
 - Configure WiFi SSID & password, broker IP etc in .ino file
 - Sketch > Verify/Compile
 - Put your ESP into flash mode (depends on board, could be automatic, could have a flash/reset button or ground GPIO0 etc)
-- Sketch > Upload 
+- Sketch > Upload
 
-**WIRING (See images for locations):**
+**DISMANTLING IHD**
+
+After removing the stand there are 2 screws to remove. One is visible, but the 2nd is well hidden. Firstly remove the white sticker (or paint?) then remove a small black plastic plug which I initially missed.
+
+**WIRING:**
+<img width="1002" height="715" alt="image" src="https://github.com/user-attachments/assets/82a61abf-7ac1-4d48-8289-fd4df3c74f73" />
+
 - Trio II J8 (TX) <> ESP RX (Pin D7/GPIO13 for Nodemcu)
 - GND <> GND
-- 5V <> 5V (or 3V3 <> 3V3 depending on your board)
- 
+- 5V <> 5V
+<img width="709" height="691" alt="image" src="https://github.com/user-attachments/assets/ebaee490-d495-40e9-97b9-8659a9a5374c" />
+
+I routed the wires out the port on the back where the existing WiFi module usually sits.
+In theory you could flash and reuse the ESP8285 found in the existing WiFi module and also reuse the existing pin header. This was my initial plan, but I realised the IHD will still transmit on the TX pin and that would clash with the TX pin that we jump from the zigbee chip. Therefore I found it easier to just use another ESP board (nodemcu) which is easy to flash and wire up.
+  
 **SETUP:**
 
 If no WiFi was configured in this script then the device will create a hotspot called geotrio2mqtt.
@@ -79,3 +91,13 @@ e.g in mqtt.yaml
         {{ this.state }}
       {% endif %}
 ```
+If you need gas usage in kWh then you can use this template as an approximation (the actual calculation is more complex and varies by geographical location but is usually found on your bill)
+```
+  - name: "Gas Meter kWh"
+    unique_id: gas_meter_kwh
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    state: "{{ (states('sensor.gas_meter') | float * 11.1868) | round(3) }}"
+    availability: "{{ states('sensor.gas_meter') | is_number }}"
+```  
