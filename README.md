@@ -66,13 +66,22 @@ This is the frequency transmitted by the smart meter itself so can't be changed 
 
 Also, despite gas readings being published every 2 minutes I believe they only update every 30 minutes.
 
+**WEBSERVER**
+The ESP will also serve a small webpage with the live readings/usage. You can find this on port 80 at whatever IP address your router assigned it.
+<img width="668" height="500" alt="image" src="https://github.com/user-attachments/assets/780e938f-5aae-4a52-9921-0dfccefa3991" />
+
+You can also fetch a JSON object of the values from http://x.x.x.x/live
+Example:
+`{"elecW":168,"elecWage":"6s ago","elecK":14473.801,"elecKage":"6s ago","gasK":4236.845,"gasKage":"80s ago","rssi":-71,"ssid":"MyFi","mqtt":1,"up":2618,"heap":43296,"heapTotal":86096}`
+
+
 **KNOWN ISSUES:**
 
 I noticed some extremely large erroneous geotrio/gas/meter values.
-These seemed to occur every few hours but the previous and next values were correct.
+These seemed to occur every few hours but the values before and after were correct.
 
-I recommend setting a filter in HomeAssistant to ignore these values.
-(I didn't see any erroneous values for the electricity topics but it may be worth apply the same fix to these too)
+I recommend setting a filter in HomeAssistant to ignore these values so they don't mess up your energy dashboard.
+(I didn't see any erroneous values for the electricity topics but it may be worth applying the same fix to these too)
 
 e.g in mqtt.yaml
 ```
