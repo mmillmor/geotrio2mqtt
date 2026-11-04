@@ -1,5 +1,5 @@
 /*
- * geotrio2mqtt.ino
+ * geotrio2mqtt.ino - https://github.com/nadnerb33/geotrio2mqtt/
  * -------------------------------------------------------------------------
  * Geo Trio II smart meter display -> MQTT
  *
@@ -8,7 +8,7 @@
  * - ESP8266 (or ESP32 etc)
  * - Soldering iron
  * - wire
- * - (Optional) USB-to-serial adapter if you're using a bare ESP board or the existing Trio II wifi module (ESP8285)
+ * - (Optional) USB-to-serial adaptor if you're using a bare ESP board or the existing Trio II wifi module (ESP8285)
  * 
  * SOFTWARE REQUIREMENTS:
  *  - Arduino IDE
@@ -26,7 +26,7 @@
  *     - Paste http://arduino.esp8266.com/stable/package_esp8266com_index.json
  * - Tools > Board > Board Manager > ESP8266 > Install
  * - Tools > Board > ESP8266 Boards > Then pick your particular variant
- * - Tools > Port > Select Serial port / USB (Make sure your USB serial adapter is plugged in first)
+ * - Tools > Port > Select Serial port / USB (Make sure your USB serial adaptor is plugged in first)
  * - Configure WiFi SSID & password in .ino file
  * - Sketch > Verify/Compile
  * - Put your ESP into flash mode (depends on board, could be automatic, could have a flash/reset button or ground GPIO0 etc)
@@ -54,10 +54,9 @@
  * Also, despite gas readings being published every 2 minutes I believe they only update every 30 minutes.
  *
  * KNOWN ISSUES:
- * - I noticed some extremely large erroneous <base>/gas/meter values. I didn't see it happen, but the same may apply to elec/meter too.
- *   These seemed to occur every few hours but the value 2 minutes before and 2 minutes later were always correct.
- *   I recommend setting a filter in HomeAssistant to ignore these values.
- *   e.g in mqtt.yaml
+ * I noticed some extremely large erroneous geotrio/gas/meter values. These seemed to occur every few hours but the previous and next values were correct.
+ * I recommend setting a filter in HomeAssistant to ignore these values. (I didn't see any erroneous values for the electricity topics but it may be worth apply the same fix to these too)
+ * e.g in mqtt.yaml
  *   - sensor:
         - name: "Gas Meter"
           unique_id: gas_meter
@@ -88,8 +87,8 @@ struct Config {
   // MQTT broker details
   char host[40] = "192.168.0.33", port[6] = "1883", user[32] = "", mpass[32] = "";
   
-  // MQTT topic base e.g <geotrio2>/elec/live_power_w
-  char base[48] = "geotrio2";
+  // MQTT topic base e.g <geotrio>/elec/live_power_w
+  char base[48] = "geotrio";
   
   char baud[8] = "115200";
 } cfg;
