@@ -43,8 +43,17 @@ inline uint32_t platformHeapTotal() { return ESP.getFreeHeap()+ESP.getMaxFreeBlo
 inline void platformSetHostname(const char*n) { WiFi.hostname(n); }   // before WiFi.begin()
 inline void platformLoop() { MDNS.update(); }                          // ESP8266 mDNS needs polling
 inline void platformConfigTime(const char*tz) { configTime(tz,"pool.ntp.org","time.google.com"); }
-// History kept for the web page charts (less RAM than ESP32)
-#define HIST_DAYS 62
+// file system space, and listing the files in its root folder (names without a leading '/')
+inline void platformFSInfo(size_t&used,size_t&total) {
+  FSInfo i;
+  LittleFS.info(i);
+  used=i.usedBytes;
+  total=i.totalBytes;
+}
+template<typename F> void platformListFiles(F fn) {
+  Dir d=LittleFS.openDir("/");
+  while(d.next()) fn(d.fileName());
+}
 
 #elif defined(ESP32)
 // ===================== ESP32 (e.g. Seeed XIAO ESP32S3) =====================
@@ -77,8 +86,21 @@ inline uint32_t platformHeapTotal() { return ESP.getHeapSize(); }
 inline void platformSetHostname(const char*n) { WiFi.setHostname(n); }   // before WiFi.begin()
 inline void platformLoop() {}
 inline void platformConfigTime(const char*tz) { configTzTime(tz,"pool.ntp.org","time.google.com"); }
-// History kept for the web page charts
-#define HIST_DAYS 400
+// file system space, and listing the files in its root folder (names without a leading '/')
+inline void platformFSInfo(size_t&used,size_t&total) {
+  used=LittleFS.usedBytes();
+  total=LittleFS.totalBytes();
+}
+template<typename F> void platformListFiles(F fn) {
+  File root=LittleFS.open("/");
+  if(!root) return;
+  for(File f=root.openNextFile();f;f=root.openNextFile()) {
+    String n=f.name();
+    f.close();
+    if(n.startsWith("/")) n=n.substring(1);
+    fn(n);
+  }
+}
 
 #else
 #error "geotrio2mqtt supports ESP8266 and ESP32 boards - see platform.h"

@@ -99,7 +99,7 @@ The ESP will also serve a small webpage with the live readings/usage. You can fi
 - Electricity and gas meter readings
 - Usage and cost for today, this week and this month
 - Tariff: unit rates and standing charges, gas calorific value and volume correction
-- History charts: the last 24 hours (electricity and gas power, per minute), daily bars for the last 31 days and monthly bars for the last 13 months, in kWh or £
+- History: electricity and gas by Day (power per minute), Week and Month (daily bars), Year (monthly bars) or All (yearly bars), in kWh or £, with arrows to step back through earlier periods and clicking a bar to drill down
 - Status: WiFi, MQTT, uptime, memory, meter data received and the scaling in use
 
 It can also be reached at `http://geotrio2mqtt.local` (or the device name set on the settings page). The last gas values are saved and shown straight away after a restart, with how long ago they changed.
@@ -114,15 +114,17 @@ The JSON also includes `gasP` / `gasPage` (gas power now in kW, and when it was 
 
 **HISTORY CHARTS:**
 
-The web page charts use history kept on the ESP:
-- Last 24 hours: one sample a minute, kept in RAM and saved to flash every 30 minutes
-- Daily and monthly kWh and cost: recorded from the meter's "today" and "this month" figures, plus the previous days' and months' electricity figures the meter sends when the Trio II starts up (so the charts have some history straight away). The ESP32 keeps 400 days, the ESP8266 62 days, both keep 26 months.
+The History chart uses data kept in the ESP's flash:
+- One file per day of 1-minute electricity and gas power samples (about 6 KB a day)
+- One small file per year of daily kWh and cost, and one per year of monthly kWh and cost
 
-The meter doesn't send previous days or months for gas, so gas history builds up from when the ESP is installed. The charts need the time from the internet (for the UK time zone, set by `TIMEZONE` in the .ino).
+These are recorded from the meter's live, "today" and "this month" figures, plus the previous days' and months' electricity figures the meter sends when the Trio II starts up (so the charts have some history straight away). The meter doesn't send previous days or months for gas, so gas history builds up from when the ESP is installed. Today's samples and this year's totals are held in RAM and saved every 30 minutes and at midnight.
 
-Flash wear isn't a concern: saving every 30 minutes uses a tiny fraction of the flash's write endurance, spread across the whole file system by LittleFS.
+History may use up to 80% of the flash file system (`HIST_FS_MAX_PCT` in the .ino), leaving the rest free for other things. Beyond that the oldest files are deleted: 1-minute days first, then old daily totals, then old monthly totals - so you keep months of minute-by-minute detail and many years of daily and monthly totals. Flash wear isn't a concern: saving every 30 minutes uses a tiny fraction of the flash's write endurance, spread across the whole file system by LittleFS.
 
-You can also fetch the chart data from http://x.x.x.x/hist
+Days and months follow local time (`TIMEZONE` in the .ino, UK by default), set from the internet.
+
+You can also fetch the chart data from http://x.x.x.x/hist - `?s=day&d=<day>`, `?s=days&from=<day>&n=<count>` or `?s=months&from=<month>&n=<count>` (days are counted from 1 Jan 1970, months as year x 12 + month).
 
 **DEBUG LOG:**
 - ESP32: the USB serial port (Serial Monitor at 115200)
