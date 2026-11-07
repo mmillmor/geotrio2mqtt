@@ -114,6 +114,14 @@ uint32_t gasEpoch=0;
 double vGasP=NAN;
 unsigned long tGasChg=0;
 
+// Tariff, from the price messages the hub sends about once an hour ([0]=elec, [1]=gas).
+// Saved to flash so it shows straight after a restart.
+double vRate[2]={NAN,NAN};       // unit rate, GBP/kWh
+double vStanding[2]={NAN,NAN};   // standing charge, GBP/day
+double vCV=NAN, vCF=NAN;         // gas calorific value (MJ/m3) and volume correction factor
+bool tariffDirty=false;
+const char *TARIFFF="/tariff.json";
+
 // diagnostics: raw bytes seen on the meter UART, complete frames, frames we decoded
 unsigned long rxBytes=0, rxFrames=0, rxDecoded=0;
 
@@ -237,11 +245,42 @@ void loadGas() {
   f.close();
 }
 
-void pub(const char*sub,double v,bool ret) {
+// ---------- tariff persistence ----------
+void saveTariff() {
+  JsonDocument d;
+  for(int i=0;i<2;i++) {
+    d["r"][i]=vRate[i];                  // NaN is written as null
+    d["s"][i]=vStanding[i];
+  }
+  d["cv"]=vCV;
+  d["cf"]=vCF;
+  File f=LittleFS.open(TARIFFF,"w");
+  if(f) {
+    serializeJson(d,f);
+    f.close();
+  }
+}
+
+void loadTariff() {
+  File f=LittleFS.open(TARIFFF,"r");
+  if(!f) return;
+  JsonDocument d;
+  if(!deserializeJson(d,f)) {
+    for(int i=0;i<2;i++) {
+      vRate[i]=d["r"][i]|(double)NAN;
+      vStanding[i]=d["s"][i]|(double)NAN;
+    }
+    vCV=d["cv"]|(double)NAN;
+    vCF=d["cf"]|(double)NAN;
+  }
+  f.close();
+}
+
+void pub(const char*sub,double v,bool ret,int dp=3) {
   if(!mqtt.connected()) return;
   char tp[96],pl[24];
   snprintf(tp,sizeof tp,"%s/%s",cfg.base,sub);
-  dtostrf(v,0,3,pl);
+  dtostrf(v,0,dp,pl);
   mqtt.publish(tp,pl,ret);
 }
 
@@ -251,6 +290,7 @@ static size_t fl=0;
 static bool inF=false,esc=false;
 static const uint8_t TAG[4]        = {0x01, 0x09, 0x07, 0x02};   // metering cluster 0x0702
 static const uint8_t TAG_PREPAY[4] = {0x01, 0x09, 0x07, 0x05};   // prepayment cluster 0x0705
+static const uint8_t TAG_PRICE[4]  = {0x01, 0x09, 0x07, 0x00};   // price cluster 0x0700
 static const uint8_t DEM[4]        = {0x00, 0x04, 0x00, 0x2A};   // 0x0400 instantaneous demand
 static const uint8_t SUM[4]        = {0x00, 0x00, 0x00, 0x25};   // 0x0000 summation delivered
 static const uint8_t UOM[4]        = {0x00, 0x03, 0x00, 0x30};   // 0x0300 unit of measure
@@ -315,6 +355,87 @@ void handlePrepay(const uint8_t*f,size_t n) {
   }
 }
 
+uint32_t le32(const uint8_t*p) {
+  return p[0]|(p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+}
+double pow10i(int d) {
+  double v=1;
+  while(d-->0) v*=10;
+  return v;
+}
+// Like readUAttr, for an 8-bit bitmap attribute (type 0x18)
+bool readAttr8(const uint8_t*f,size_t n,uint16_t id,uint8_t&out) {
+  for(size_t i=0;i+5<=n;i++) {
+    if(f[i]==(id&0xFF)&&f[i+1]==(id>>8)&&f[i+2]==0x00&&f[i+3]==0x18) {
+      out=f[i+4];
+      return true;
+    }
+  }
+  return false;
+}
+// store + publish one tariff value (GBP or MJ/m3), flagging a save if it changed
+void setTariff(double&var,double v,const char*fuel,const char*name,int dp) {
+  if(v!=var) {
+    var=v;
+    tariffDirty=true;
+  }
+  char sub[40];
+  snprintf(sub,sizeof sub,"%s/%s",fuel,name);
+  pub(sub,v,true,dp);
+}
+
+// Price cluster (0x0700) frames - sent by the hub about once an hour.
+// Electricity uses endpoint 1, gas endpoint 3 (2 also accepted as gas).
+//  - PublishPrice (cmd 0x00): unit rate
+//  - PublishTariffInformation (cmd 0x04): standing charge
+//  - PublishConversionFactor / PublishCalorificValue (cmds 0x02 / 0x03), or a read-attributes
+//    response with attrs 0x0302/0x0303 and 0x0304/0x0306: gas volume correction and calorific value
+// Each value carries its own number of decimal places ("trailing digits", high nibble).
+bool handlePrice(const uint8_t*f,size_t n) {
+  int t=fseq(f,n,TAG_PRICE);
+  if(t<0||(size_t)(t+22)>n) return false;
+  uint8_t ep=f[t+4];
+  int fi=(ep==1)?0:(ep==2||ep==3)?1:-1;
+  if(fi<0) return false;
+  // ZCL frame: length byte at t+18, then frame control, [manufacturer code], sequence, command
+  size_t L=f[t+18], z=t+19;
+  if(z+L>n) return false;
+  const uint8_t*zcl=f+z;
+  uint8_t fc=zcl[0];
+  size_t h=(fc&0x04)?5:3;
+  if(L<h) return false;
+  uint8_t cmd=zcl[h-1];
+  const uint8_t*p=zcl+h;
+  size_t pl=L-h;
+  rxDecoded++;
+  const char*nm=fi?"gas":"elec";
+  if((fc&0x03)==1) {                  // cluster-specific command
+    if(cmd==0x00 && pl>5) {           // PublishPrice
+      size_t o=5+p[4];                // after ProviderID + RateLabel
+      if(o+23<=pl) setTariff(vRate[fi],le32(p+o+19)/pow10i(p[o+11]>>4),nm,"unit_rate",5);
+    }
+    else if(cmd==0x04 && pl>18) {     // PublishTariffInformation
+      size_t o=18+p[17];              // after IDs, StartTime, TariffType + TariffLabel
+      if(o+10<=pl) setTariff(vStanding[fi],le32(p+o+6)/pow10i(p[o+5]>>4),nm,"standing_charge",5);
+    }
+    else if(cmd==0x02 && fi==1 && pl>=13) {   // PublishConversionFactor
+      setTariff(vCF,le32(p+8)/pow10i(p[12]>>4),"gas","conversion_factor",5);
+    }
+    else if(cmd==0x03 && fi==1 && pl>=14) {   // PublishCalorificValue
+      setTariff(vCV,le32(p+8)/pow10i(p[13]>>4),"gas","calorific_value",2);
+    }
+  }
+  else if(cmd==0x01 && fi==1) {        // read attributes response (commodity attributes)
+    uint64_t v;
+    uint8_t td;
+    if(readUAttr(p,pl,0x0304,v) && readAttr8(p,pl,0x0306,td))
+      setTariff(vCV,v/pow10i(td>>4),"gas","calorific_value",2);
+    if(readUAttr(p,pl,0x0302,v) && readAttr8(p,pl,0x0303,td))
+      setTariff(vCF,v/pow10i(td>>4),"gas","conversion_factor",5);
+  }
+  return true;
+}
+
 // Metering cluster (0x0702) frame carrying the meter's formatting attributes
 // (sent when the Trio II starts up): learn multiplier 0x0301 / divisor 0x0302.
 void learnScaling(const uint8_t*f,size_t n,int fi) {
@@ -341,7 +462,7 @@ void handle(const uint8_t*f,size_t n) {
   if(n<6||f[0]!=0x80||f[1]!=0x02) return;
   int t=fseq(f,n,TAG);
   if(t<0) {
-    handlePrepay(f,n);
+    if(!handlePrice(f,n)) handlePrepay(f,n);
     return;
   }
   if((size_t)(t+4)>=n) return;
@@ -527,6 +648,13 @@ void sendLiveJson() {
     j+="]";
   }
   j+="],";
+  // t: [[elec unit rate p/kWh, elec standing p/day],[gas ...]]; cv MJ/m3, cf volume correction
+  j+="\"t\":[";
+  for(int a=0;a<2;a++) {
+    j+=(a?",[":"[");
+    j+=numStr(vRate[a]*100,3)+","+numStr(vStanding[a]*100,3)+"]";
+  }
+  j+="],\"cv\":"+numStr(vCV,2)+",\"cf\":"+numStr(vCF,5)+",";
   j+="\"scale\":\""+scaleStr(0)+", "+scaleStr(1)+"\",";
   j+="\"rssi\":"+String(WiFi.RSSI())+",";
   j+="\"ssid\":\""+String(WiFi.status()==WL_CONNECTED?WiFi.SSID():"")+"\",";
@@ -580,6 +708,13 @@ void handleRoot() {
   "<tr><th style='text-align:left'>Elec</th><td id=cED>---</td><td id=cEW>---</td><td id=cEM>---</td></tr>"
   "<tr><th style='text-align:left'>Gas</th><td id=cGD>---</td><td id=cGW>---</td><td id=cGM>---</td></tr>"
   "</table></div>";
+  h+="<div class=card><div class=sub>Tariff (from meter)</div>"
+  "<table style='width:100%;text-align:right;font-size:18px;margin-top:6px'>"
+  "<tr class=sub><th></th><th>Unit rate (p/kWh)</th><th>Standing (p/day)</th></tr>"
+  "<tr><th style='text-align:left'>Elec</th><td id=tER>---</td><td id=tES>---</td></tr>"
+  "<tr><th style='text-align:left'>Gas</th><td id=tGR>---</td><td id=tGS>---</td></tr>"
+  "</table><div class=sub style='margin-top:8px'>Gas calorific value <span id=gcv>---</span> MJ/m&#179;, "
+  "volume correction <span id=gcf>---</span></div></div>";
   h+="<div class=card><div class=sub>Status</div>"
   "<div id=st class=sub></div></div>";
   h+="<a href=/config><button type=button>Settings</button></a>";
@@ -626,6 +761,9 @@ void handleRoot() {
   "[[hED,hEW,hEM],[hGD,hGW,hGM]].forEach((r,a)=>r.forEach((c,b)=>c.textContent=n1(d.h[a][b])));"
   "const n2=v=>v==null?'---':v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});"
   "[[cED,cEW,cEM],[cGD,cGW,cGM]].forEach((r,a)=>r.forEach((c,b)=>c.textContent=n2(d.c[a][b])));"
+  "const n3=v=>v==null?'---':v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:3});"
+  "[[tER,tES],[tGR,tGS]].forEach((r,a)=>r.forEach((c,b)=>c.textContent=n3(d.t[a][b])));"
+  "gcv.textContent=n(d.cv);gcf.textContent=d.cf==null?'---':d.cf.toFixed(5);"
   "let wifi=d.ssid?"
   "'WiFi: '+d.ssid+' ('+d.rssi+' dBm)'"
   ":'Access Point Mode';"
@@ -716,6 +854,7 @@ void setup() {
   loadCfg();
   loadGas();
   loadMeter();
+  loadTariff();
   snprintf(statusTopic,sizeof statusTopic,"%s/status",cfg.base);
   platformBeginMeter(atol(cfg.baud));
   LOG.printf("geotrio2mqtt node %s, meter RX on %s @ %s baud\n",nodeId,platformMeterPin().c_str(),cfg.baud);
@@ -769,11 +908,12 @@ void loop() {
       rxBytes,rxFrames,rxDecoded,(double)vElecW,(double)vElecK,(double)vGasK);
   }
 #endif
-  // save changed gas values, at most once a minute (limits flash wear)
-  if(gasDirty && millis()-lastGasSave>60000) {
+  // save changed gas / tariff values, at most once a minute (limits flash wear)
+  if((gasDirty || tariffDirty) && millis()-lastGasSave>60000) {
     lastGasSave=millis();
-    gasDirty=false;
-    saveGas();
+    if(gasDirty) saveGas();
+    if(tariffDirty) saveTariff();
+    gasDirty=tariffDirty=false;
   }
   if(apMode) {
     dns.processNextRequest();

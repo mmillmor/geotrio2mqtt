@@ -77,6 +77,9 @@ If your readings are 10x (or 100x) out, power-cycle the Trio II once while the E
 - geotrio/gas/today_kwh, week_kwh, month_kwh
 - geotrio/elec/cost_today, cost_week, cost_month (£, including standing charge)
 - geotrio/gas/cost_today, cost_week, cost_month (£, including standing charge)
+- geotrio/elec/unit_rate, geotrio/gas/unit_rate (£/kWh)
+- geotrio/elec/standing_charge, geotrio/gas/standing_charge (£/day)
+- geotrio/gas/calorific_value (MJ/m³), geotrio/gas/conversion_factor (volume correction, e.g. 1.02264)
 - geotrio/status (online/LWT offline)
 
 Note: Elec topics are published every 10 seconds while gas every 2 minutes
@@ -86,11 +89,14 @@ Also, despite gas readings being published every 2 minutes I believe they only u
 
 The meter reports gas usage for today/week/month in kWh (converted by the meter system using the calorific value), while the gas meter reading itself is in m³.
 
+The tariff (unit rates, standing charges, gas calorific value and volume correction) comes from price messages the hub sends about once an hour, so after first installing it can take up to an hour to appear. It's saved, so after that it shows straight away after a restart. These are your supplier's own figures: gas kWh = m³ × conversion_factor × calorific_value ÷ 3.6.
+
 **WEBSERVER**
 The ESP will also serve a small webpage with the live readings/usage. You can find this on port 80 at whatever IP address your router assigned it, or at `http://geotrio2mqtt.local`.
 - Energy now: an electricity dial with the exact power below it, and a gas flame showing average gas power since the last gas update (the meter doesn't send live gas power, so this is calculated like the Trio II does)
 - Electricity and gas meter readings
 - Usage and cost for today, this week and this month
+- Tariff: unit rates and standing charges, gas calorific value and volume correction
 - Status: WiFi, MQTT, uptime, memory, meter data received and the scaling in use
 
 The last gas values are saved and shown straight away after a restart, with how long ago they changed.
@@ -99,9 +105,9 @@ The last gas values are saved and shown straight away after a restart, with how 
 
 You can also fetch a JSON object of the values from http://x.x.x.x/live
 Example:
-`{"elecW":168,"elecWage":"6s ago","elecK":14473.801,"elecKage":"6s ago","gasK":4236.845,"gasKage":"2 min ago","gasP":1.25,"gasPage":"8 min ago","h":[[5.2,40.1,120.4],[30.5,210.7,600.2]],"c":[[2.10,15.30,46.80],[2.25,13.70,39.10]],"scale":"elec /1000 (from meter), gas /1000 (from meter)","rssi":-71,"ssid":"MyFi","mqtt":1,"up":2618,"heap":43296,"rxB":81234,"rxF":2450,"rxD":240,"heapTotal":86096}`
+`{"elecW":168,"elecWage":"6s ago","elecK":14473.801,"elecKage":"6s ago","gasK":4236.845,"gasKage":"2 min ago","gasP":1.25,"gasPage":"8 min ago","h":[[5.2,40.1,120.4],[30.5,210.7,600.2]],"c":[[2.10,15.30,46.80],[2.25,13.70,39.10]],"t":[[24.500,48.000],[6.000,29.000]],"cv":39.80,"cf":1.02264,"scale":"elec /1000 (from meter), gas /1000 (from meter)","rssi":-71,"ssid":"MyFi","mqtt":1,"up":2618,"heap":43296,"rxB":81234,"rxF":2450,"rxD":240,"heapTotal":86096}`
 
-`h` is usage in kWh and `c` is cost in £, each as [[elec today, week, month], [gas today, week, month]].
+`h` is usage in kWh and `c` is cost in £, each as [[elec today, week, month], [gas today, week, month]]. `t` is the tariff as [[elec unit rate p/kWh, elec standing charge p/day], [gas ...]].
 
 **DEBUG LOG:**
 - ESP32: the USB serial port (Serial Monitor at 115200)
