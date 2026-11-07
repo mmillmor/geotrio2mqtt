@@ -200,6 +200,9 @@ uint32_t gasEpoch=0;
 // change in gas kWh-today (like the Trio display does). tGasChg = millis() of last change.
 double vGasP=NAN;
 unsigned long tGasChg=0;
+// real time (UTC seconds) of that last change, saved with vGasP so after a restart the flame
+// shows straight away, goes idle correctly and the next average is measured from it
+uint32_t gasPEpoch=0;
 
 // Tariff, from the price messages the hub sends about once an hour ([0]=elec, [1]=gas).
 // Saved to flash so it shows straight after a restart.
@@ -224,10 +227,20 @@ double kwSetting(const char*s,double def) {
   return (v>0 && v<1000) ? v : def;
 }
 
+// seconds since gas kWh-today last changed (this session, or the saved real time after a
+// restart); -1 if unknown
+long gasChgAge() {
+  if(tGasChg) return (long)((millis()-tGasChg)/1000);
+  uint32_t now=nowEpoch();
+  if(gasPEpoch && now>=gasPEpoch) return (long)(now-gasPEpoch);
+  return -1;
+}
+
 // gas power now (kW) for the web page and history: 0 if gas kWh hasn't moved for GAS_IDLE_MS
 double gasPowerNow() {
   double gp=vGasP;
-  if(!isnan(gp) && millis()-tGasChg>GAS_IDLE_MS) gp=0;
+  long age=gasChgAge();
+  if(!isnan(gp) && age>=0 && (unsigned long)age*1000UL>GAS_IDLE_MS) gp=0;
   return gp;
 }
 
@@ -565,6 +578,8 @@ void saveGas() {
   JsonDocument d;
   d["k"]=(double)vGasK;                  // NaN is written as null
   d["t"]=gasEpoch;                       // when it changed (UTC seconds, 0 = unknown)
+  d["p"]=vGasP;                          // gas power now (kW) ...
+  d["pt"]=gasPEpoch;                     // ... and when gas kWh-today last changed
   JsonArray h=d["h"].to<JsonArray>();
   JsonArray c=d["c"].to<JsonArray>();
   for(int i=0;i<3;i++) {
@@ -585,6 +600,8 @@ void loadGas() {
   if(!deserializeJson(d,f)) {
     vGasK=d["k"]|(double)NAN;
     gasEpoch=d["t"]|(uint32_t)0;
+    vGasP=d["p"]|(double)NAN;
+    gasPEpoch=d["pt"]|(uint32_t)0;
     for(int i=0;i<3;i++) {
       vHist[1][i]=d["h"][i]|(double)NAN;
       vCost[1][i]=d["c"][i]|(double)NAN;
@@ -877,15 +894,14 @@ void handle(const uint8_t*f,size_t n) {
       double v=(ch==1) ? raw*scale(0) : raw/GAS_KWH_DIVISOR;
       if(fi==1 && v!=vHist[fi][i]) {
         gasDirty=true;
-        // gas today changed: average kW since the previous change seen this session
+        // gas today changed: average kW since the previous change (this session, or the
+        // saved one from before a restart - using its saved real time)
         if(i==0) {
           double prev=vHist[1][0];
-          unsigned long nowMs=millis();
-          if(tGasChg && !isnan(prev) && v>=prev) {
-            double hrs=(nowMs-tGasChg)/3600000.0;
-            if(hrs>0) vGasP=(v-prev)/hrs;
-          }
-          tGasChg=nowMs;   // first change (or midnight reset) just sets the baseline
+          long age=gasChgAge();
+          if(age>0 && !isnan(prev) && v>=prev) vGasP=(v-prev)/(age/3600.0);
+          tGasChg=millis();   // first change (or midnight reset) just sets the baseline
+          gasPEpoch=nowEpoch();
         }
       }
       vHist[fi][i]=v;
@@ -1003,7 +1019,8 @@ void sendLiveJson() {
   j+="\"gasK\":"+numStr(vGasK,3)+",\"gasKage\":\""+gasAge+"\",";
   // gas power now (kW): 0 if gas kWh hasn't moved for GAS_IDLE_MS
   double gp=gasPowerNow();
-  j+="\"gasP\":"+numStr(gp,2)+",\"gasPage\":\""+ageStr(tGasChg)+"\",";
+  long gpAge=gasChgAge();
+  j+="\"gasP\":"+numStr(gp,2)+",\"gasPage\":\""+(gpAge<0 ? String("never") : fmtAge(gpAge))+"\",";
   // h: [[elec today,week,month],[gas today,week,month]] in kWh
   j+="\"h\":[";
   for(int a=0;a<2;a++) {
