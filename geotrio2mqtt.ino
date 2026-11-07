@@ -126,6 +126,15 @@
 // port (see platform.h). Useful for finding new data in the meter's messages.
 #define DUMP_UNDECODED 0
 
+// Local time zone (POSIX format), used for the history charts' days and months.
+// UK: GMT in winter, BST (+1h) from the last Sunday in March to the last Sunday in October.
+#define TIMEZONE "GMT0BST,M3.5.0/1,M10.5.0"
+// History for the web page charts: 1-minute power samples for the last 24 hours (RAM),
+// plus daily (HIST_DAYS, set in platform.h) and monthly kWh/cost. Saved to flash this often.
+#define HIST_MINS 1440
+#define HIST_MONTHS 26
+#define HIST_SAVE_MIN 30
+
 // ===============================================================================
 
 #define STR_(x) #x
@@ -209,6 +218,163 @@ uint32_t nowEpoch() {
 double kwSetting(const char*s,double def) {
   double v=atof(s);
   return (v>0 && v<1000) ? v : def;
+}
+
+// gas power now (kW) for the web page and history: 0 if gas kWh hasn't moved for GAS_IDLE_MS
+double gasPowerNow() {
+  double gp=vGasP;
+  if(!isnan(gp) && millis()-tGasChg>GAS_IDLE_MS) gp=0;
+  return gp;
+}
+
+// ---------- history for the web page charts ----------
+// 1-minute samples for the last 24h, kept in RAM: elec W and gas kW x100, indexed by
+// (UTC minute % HIST_MINS). hMin = UTC minute currently being sampled (0 = clock not synced yet).
+#define HNOVAL INT16_MIN
+int16_t hMinE[HIST_MINS], hMinG[HIST_MINS];
+uint32_t hMin=0;
+bool hMinLoaded=false;         // hMin came from flash: fill the gap since then on first tick
+double hESum=0;
+uint16_t hECnt=0;
+// daily / monthly totals: key = local day number (days since 1970) or year*12+month;
+// v = [elec kWh, gas kWh, elec GBP, gas GBP]
+struct HRec { uint16_t key; float v[4]; };
+HRec hDay[HIST_DAYS], hMon[HIST_MONTHS];
+bool histDirty=false;
+unsigned long lastHistSave=0;
+// previous-day / previous-month electricity figures the meter sends when the Trio II starts
+// up; held until the clock is synced, then filed under the right days/months
+uint64_t pDayE[8], pMonE[13];
+double pDayC[8], pMonC[13];
+uint16_t pDayEm=0, pMonEm=0, pDayCm=0, pMonCm=0;   // bitmasks of which are waiting
+
+// days since 1970-01-01 for a calendar date (H. Hinnant's algorithm)
+int32_t daysFromCivil(int y,unsigned m,unsigned d) {
+  y-=m<=2;
+  int era=(y>=0?y:y-399)/400;
+  unsigned yoe=(unsigned)(y-era*400);
+  unsigned doy=(153*(m+(m>2?-3:9))+2)/5+d-1;
+  unsigned doe=yoe*365+yoe/4-yoe/100+doy;
+  return era*146097+(int32_t)doe-719468;
+}
+// local day / month keys for "now"; false if the clock isn't synced
+bool histKeys(uint16_t&day,uint16_t&mon) {
+  uint32_t now=nowEpoch();
+  if(!now) return false;
+  time_t t=now;
+  struct tm tm;
+  localtime_r(&t,&tm);
+  day=(uint16_t)daysFromCivil(tm.tm_year+1900,tm.tm_mon+1,tm.tm_mday);
+  mon=(uint16_t)((tm.tm_year+1900)*12+tm.tm_mon);
+  return true;
+}
+// record for key: existing, else an empty slot, else replace the oldest (unless key is older)
+HRec* histRec(HRec*a,int n,uint16_t key) {
+  int oldest=-1;
+  for(int i=0;i<n;i++) {
+    if(a[i].key==key) return &a[i];
+    if(oldest<0 || a[i].key<a[oldest].key) oldest=i;
+  }
+  if(a[oldest].key && a[oldest].key>key) return nullptr;
+  a[oldest].key=key;
+  for(int j=0;j<4;j++) a[oldest].v[j]=NAN;
+  return &a[oldest];
+}
+void histSet(HRec*a,int n,uint16_t key,int idx,double v) {
+  HRec*r=histRec(a,n,key);
+  if(!r || r->v[idx]==(float)v) return;
+  r->v[idx]=(float)v;
+  histDirty=true;
+}
+// a live "today"/"this month" value from the meter: fi 0=elec 1=gas, cost 0=kWh 1=GBP,
+// period 0=today 2=this month (1=week isn't charted)
+void histLive(int fi,int cost,int period,double v) {
+  uint16_t day,mon;
+  if(period==1 || isnan(v) || !histKeys(day,mon)) return;
+  if(period==0) histSet(hDay,HIST_DAYS,day,fi+cost*2,v);
+  else histSet(hMon,HIST_MONTHS,mon,fi+cost*2,v);
+}
+// file the meter's previous-day/month electricity figures once the clock is synced
+void histApplyPending() {
+  if(!(pDayEm|pMonEm|pDayCm|pMonCm)) return;
+  uint16_t day,mon;
+  if(!histKeys(day,mon)) return;
+  for(int k=0;k<8;k++) {
+    if(pDayEm&(1<<k)) histSet(hDay,HIST_DAYS,day-1-k,0,pDayE[k]*scale(0));
+    if(pDayCm&(1<<k)) histSet(hDay,HIST_DAYS,day-1-k,2,pDayC[k]);
+  }
+  for(int k=0;k<13;k++) {
+    if(pMonEm&(1<<k)) histSet(hMon,HIST_MONTHS,mon-1-k,0,pMonE[k]*scale(0));
+    if(pMonCm&(1<<k)) histSet(hMon,HIST_MONTHS,mon-1-k,2,pMonC[k]);
+  }
+  pDayEm=pMonEm=pDayCm=pMonCm=0;
+}
+int16_t clamp16(double v) {
+  long x=lround(v);
+  return (int16_t)(x<-32000 ? -32000 : x>32000 ? 32000 : x);
+}
+// called every loop: close each minute's sample when the next minute starts
+void histTick() {
+  uint32_t now=nowEpoch();
+  if(!now) return;
+  uint32_t m=now/60;
+  if(!hMin) {                      // first synced minute since boot, nothing loaded
+    hMin=m;
+    return;
+  }
+  if(m==hMin) return;
+  if(hMinLoaded) {                 // restored from flash: minutes since then are unknown
+    hMinLoaded=false;
+    for(uint32_t x=hMin;x<m && x-hMin<HIST_MINS;x++) hMinE[x%HIST_MINS]=hMinG[x%HIST_MINS]=HNOVAL;
+  } else {
+    double gp=gasPowerNow();
+    hMinE[hMin%HIST_MINS]=hECnt ? clamp16(hESum/hECnt) : HNOVAL;
+    hMinG[hMin%HIST_MINS]=isnan(gp) ? HNOVAL : clamp16(gp*100);
+    for(uint32_t x=hMin+1;x<m && x-hMin<=HIST_MINS;x++) hMinE[x%HIST_MINS]=hMinG[x%HIST_MINS]=HNOVAL;
+  }
+  hMin=m;
+  hESum=0;
+  hECnt=0;
+}
+void saveHist() {
+  File f=LittleFS.open("/hmin.bin","w");
+  if(f) {
+    f.write((const uint8_t*)&hMin,sizeof hMin);
+    f.write((const uint8_t*)hMinE,sizeof hMinE);
+    f.write((const uint8_t*)hMinG,sizeof hMinG);
+    f.close();
+  }
+  if(!histDirty) return;
+  f=LittleFS.open("/hday.bin","w");
+  if(f) {
+    f.write((const uint8_t*)hDay,sizeof hDay);
+    f.close();
+  }
+  f=LittleFS.open("/hmon.bin","w");
+  if(f) {
+    f.write((const uint8_t*)hMon,sizeof hMon);
+    f.close();
+  }
+  histDirty=false;
+}
+void loadHist() {
+  for(int i=0;i<HIST_MINS;i++) hMinE[i]=hMinG[i]=HNOVAL;
+  memset(hDay,0,sizeof hDay);
+  memset(hMon,0,sizeof hMon);
+  File f=LittleFS.open("/hmin.bin","r");
+  if(f && f.size()==sizeof hMin+sizeof hMinE+sizeof hMinG) {
+    f.read((uint8_t*)&hMin,sizeof hMin);
+    f.read((uint8_t*)hMinE,sizeof hMinE);
+    f.read((uint8_t*)hMinG,sizeof hMinG);
+    hMinLoaded=hMin!=0;
+  }
+  if(f) f.close();
+  f=LittleFS.open("/hday.bin","r");
+  if(f && f.size()==sizeof hDay) f.read((uint8_t*)hDay,sizeof hDay);
+  if(f) f.close();
+  f=LittleFS.open("/hmon.bin","r");
+  if(f && f.size()==sizeof hMon) f.read((uint8_t*)hMon,sizeof hMon);
+  if(f) f.close();
 }
 
 // ---------- config persistence ----------
@@ -425,6 +591,19 @@ void handlePrepay(const uint8_t*f,size_t n) {
       vCost[fi][i]=v;
       snprintf(sub,sizeof sub,"%s/%s",ch==1?"elec":"gas",CNM[i]);
       pub(sub,v,true);
+      histLive(fi,1,i,v);
+    }
+  }
+  // electricity cost for previous days (0x051E, 0x0520..0x052C) and months (0x0542..0x055A),
+  // sent when the Trio II starts up - filed in the history charts
+  if(fi==0) {
+    for(int k=0;k<8;k++) {
+      uint64_t raw;
+      if(readUAttr(f,n,k?0x0520+2*(k-1):0x051E,raw)) { pDayC[k]=raw/div; pDayCm|=1<<k; }
+    }
+    for(int k=0;k<13;k++) {
+      uint64_t raw;
+      if(readUAttr(f,n,0x0542+2*k,raw)) { pMonC[k]=raw/div; pMonCm|=1<<k; }
     }
   }
 }
@@ -557,6 +736,8 @@ void handle(const uint8_t*f,size_t n) {
     if(ch==1) {
       vElecW=w;
       tElecW=millis();
+      hESum+=w;     // averaged into the history chart's 1-minute samples
+      hECnt++;
     }
   }
   int s=fseq(f,n,SUM);
@@ -601,6 +782,21 @@ void handle(const uint8_t*f,size_t n) {
       vHist[fi][i]=v;
       snprintf(sub,sizeof sub,"%s/%s",nm,HNM[i]);
       pub(sub,v,true);
+      histLive(fi,0,i,v);
+    }
+  }
+  // electricity kWh for previous days (0x0403, 0x0420..0x042C) and months (0x0442..0x045A),
+  // sent when the Trio II starts up - kept raw and filed in the history charts once the
+  // clock is synced (so the scaling from the same burst is used)
+  if(ch==1) {
+    static const uint16_t PD[8]={0x0403,0x0420,0x0422,0x0424,0x0426,0x0428,0x042A,0x042C};
+    for(int k=0;k<8;k++) {
+      uint64_t raw;
+      if(readUAttr(f,n,PD[k],raw)) { pDayE[k]=raw; pDayEm|=1<<k; }
+    }
+    for(int k=0;k<13;k++) {
+      uint64_t raw;
+      if(readUAttr(f,n,0x0442+2*k,raw)) { pMonE[k]=raw; pMonEm|=1<<k; }
     }
   }
 }
@@ -697,8 +893,7 @@ void sendLiveJson() {
   else gasAge="never";
   j+="\"gasK\":"+numStr(vGasK,3)+",\"gasKage\":\""+gasAge+"\",";
   // gas power now (kW): 0 if gas kWh hasn't moved for GAS_IDLE_MS
-  double gp=vGasP;
-  if(!isnan(gp) && millis()-tGasChg>GAS_IDLE_MS) gp=0;
+  double gp=gasPowerNow();
   j+="\"gasP\":"+numStr(gp,2)+",\"gasPage\":\""+ageStr(tGasChg)+"\",";
   // h: [[elec today,week,month],[gas today,week,month]] in kWh
   j+="\"h\":[";
@@ -740,6 +935,52 @@ void sendLiveJson() {
   j+="}";
   web.send(200,"application/json",j);
 }
+// /hist: chart data, streamed in chunks to keep RAM use low.
+// {"end":<last complete UTC minute>,"e":[elec W per minute],"g":[gas kW x100 per minute],
+//  "d":[[day,elecKWh,gasKWh,elecGBP,gasGBP],...],"mo":[[year*12+month,...],...]}  (null = no data)
+void sendHist() {
+  web.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  web.send(200,"application/json","");
+  String b;
+  b.reserve(1400);
+  auto flush=[&](bool force) {
+    if(force || b.length()>1200) {
+      web.sendContent(b);
+      b="";
+    }
+  };
+  b="{\"end\":"+String(hMin ? hMin-1 : 0);
+  for(int s=0;s<2;s++) {
+    const int16_t*a=s ? hMinG : hMinE;
+    b+=s ? "],\"g\":[" : ",\"e\":[";
+    for(int i=0;hMin && i<HIST_MINS;i++) {
+      int16_t v=a[(hMin-HIST_MINS+i)%HIST_MINS];
+      if(i) b+=",";
+      b+=(v==HNOVAL) ? String("null") : String(v);
+      flush(false);
+    }
+  }
+  b+="]";
+  for(int s=0;s<2;s++) {
+    const HRec*a=s ? hMon : hDay;
+    int n=s ? HIST_MONTHS : HIST_DAYS;
+    b+=s ? "],\"mo\":[" : ",\"d\":[";
+    bool first=true;
+    for(int i=0;i<n;i++) {
+      if(!a[i].key) continue;
+      if(!first) b+=",";
+      first=false;
+      b+="["+String(a[i].key);
+      for(int j=0;j<4;j++) b+=","+numStr(a[i].v[j],j<2?3:2);
+      b+="]";
+      flush(false);
+    }
+  }
+  b+="]}";
+  flush(true);
+  web.sendContent("");   // end of chunked response
+}
+
 void handleRoot() {
   String h=FPSTR(PAGE_HEAD);
   h+="<div class=w><h1>geotrio2mqtt</h1>";
@@ -789,6 +1030,16 @@ void handleRoot() {
   "<tr><th style='text-align:left'>Gas</th><td id=tGR>---</td><td id=tGS>---</td></tr>"
   "</table><div class=sub style='margin-top:8px'>Gas calorific value <span id=gcv>---</span> MJ/m&#179;, "
   "volume correction <span id=gcf>---</span></div></div>";
+  // history charts (drawn by hl()/dr() below from /hist)
+  h+="<div class=card><div class=sub>Last 24 hours (kW) &nbsp; "
+  "<span style='color:#6fb3ff'>&#9632; elec</span> <span style='color:#ff9f43'>&#9632; gas</span></div>"
+  "<svg id=c24 viewBox='0 0 600 180' style='width:100%;margin-top:6px'></svg></div>"
+  "<div class=card><div class=sub>Daily &nbsp; "
+  "<span style='color:#6fb3ff'>&#9632; elec</span> <span style='color:#ff9f43'>&#9632; gas</span> &nbsp; "
+  "Show: <a href='javascript:sU(0)'>kWh</a> | <a href='javascript:sU(1)'>&pound;</a></div>"
+  "<svg id=cd viewBox='0 0 600 170' style='width:100%;margin-top:6px'></svg></div>"
+  "<div class=card><div class=sub>Monthly</div>"
+  "<svg id=cm viewBox='0 0 600 170' style='width:100%;margin-top:6px'></svg></div>";
   h+="<div class=card><div class=sub>Status</div>"
   "<div id=st class=sub></div></div>";
   h+="<a href=/config><button type=button>Settings</button></a>";
@@ -848,6 +1099,48 @@ void handleRoot() {
   "' - Scaling: '+d.scale;"
   "}catch(e){}}"
   "u();setInterval(u,2000);"
+  // ---- history charts: fetched once a minute ----
+  "let H=null,U=0;"
+  "function sU(x){U=x;dr()}"
+  "const MN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];"
+  "async function hl(){try{let r=await fetch('/hist');H=await r.json();dr()}catch(e){}}"
+  "function dr(){if(!H)return;line();"
+  "bars('cd',H.d,31,k=>{const t=new Date(k*864e5);return t.getUTCDate()+'/'+(t.getUTCMonth()+1)});"
+  "bars('cm',H.mo,13,(k,i)=>MN[k%12]+(k%12&&i?'':' '+(Math.floor(k/12)%100)))}"
+  // last 24h: elec (W) and gas (kW x100) per minute as lines, each on its own kW scale
+  // (elec max top-left in blue, gas max top-right in orange) so a boiler doesn't flatten elec
+  "function line(){const W=600,B=160,e=H.e,g=H.g,n=e.length,el=document.getElementById('c24');"
+  "if(!n){el.innerHTML=\"<text x='300' y='90' text-anchor='middle' font-size='13' fill='#8a93a0'>waiting for the clock to sync</text>\";return}"
+  "const M=(a,d)=>{let m=0.5;a.forEach(v=>{if(v!=null)m=Math.max(m,v/d)});return Math.ceil(m)},me=M(e,1000),mg=M(g,100);"
+  "const X=i=>(i*W/(n-1)).toFixed(1);"
+  "const P=(a,d,mx)=>{let s='',on=0;for(let i=0;i<n;i++){if(a[i]==null){on=0;continue}"
+  "s+=(on?'L':'M')+X(i)+' '+(B-a[i]/d/mx*(B-22)).toFixed(1);on=1}return s};"
+  "let s=`<line x1='0' y1='${B}' x2='${W}' y2='${B}' stroke='#2a313b'/>"
+  "<text x='2' y='15' font-size='16' fill='#6fb3ff'>${me} kW</text>"
+  "<text x='${W-2}' y='15' text-anchor='end' font-size='16' fill='#ff9f43'>${mg} kW</text>`;"
+  "for(let q=0;q<=4;q++){const i=Math.round(q*(n-1)/4),t=new Date((H.end-n+1+i)*6e4);"
+  "s+=`<text x='${X(i)}' y='178' text-anchor='${q?q<4?'middle':'end':'start'}' font-size='16' fill='#8a93a0'>"
+  "${t.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</text>`}"
+  "s+=`<path d='${P(g,100,mg)}' fill='none' stroke='#ff9f43' stroke-width='1.5'/>"
+  "<path d='${P(e,1000,me)}' fill='none' stroke='#6fb3ff' stroke-width='1.5'/>`;"
+  "el.innerHTML=s}"
+  // daily / monthly: grouped bars (elec, gas) for the last N days/months, kWh or GBP
+  "function bars(id,rows,N,lab){const el=document.getElementById(id),o=U?3:1,W=600,B=150,bw=W/N,m={};"
+  "rows=rows||[];rows.forEach(r=>m[r[0]]=r);"
+  "if(!rows.length){el.innerHTML=\"<text x='300' y='80' text-anchor='middle' font-size='13' fill='#8a93a0'>no data yet</text>\";return}"
+  "const last=Math.max(...rows.map(r=>r[0]));let mx=0;"
+  "for(let k=last-N+1;k<=last;k++){const r=m[k];if(r)mx=Math.max(mx,r[o]||0,r[o+1]||0)}if(!mx)mx=1;"
+  "const F=v=>U?'\\u00a3'+v.toFixed(2):v.toFixed(1)+' kWh';"
+  "let s=`<line x1='0' y1='${B}' x2='${W}' y2='${B}' stroke='#2a313b'/>"
+  "<text x='2' y='15' font-size='16' fill='#8a93a0'>${F(mx)}</text>`;"
+  "for(let i=0;i<N;i++){const k=last-N+1+i,r=m[k],x=i*bw;"
+  "for(let j=0;j<2;j++){const v=r?r[o+j]:null;if(v==null)continue;const h=v/mx*(B-22);"
+  "s+=`<rect x='${(x+bw*.1+j*bw*.4).toFixed(1)}' y='${(B-h).toFixed(1)}' width='${(bw*.38).toFixed(1)}' "
+  "height='${h.toFixed(1)}' fill='${j?'#ff9f43':'#6fb3ff'}'><title>${lab(k)} ${j?'gas':'elec'}: ${F(v)}</title></rect>`}"
+  "if((N-1-i)%Math.ceil(N/8)==0)s+=`<text x='${(i?i<N-1?x+bw/2:x+bw:x).toFixed(1)}' y='168' "
+  "text-anchor='${i?i<N-1?'middle':'end':'start'}' font-size='16' fill='#8a93a0'>${lab(k,i)}</text>`}"
+  "el.innerHTML=s}"
+  "hl();setInterval(hl,60000);"
   "</script></div>";
   web.send(200,"text/html",h);
 }
@@ -908,6 +1201,7 @@ void handleSave() {
 void startWeb() {
   web.on("/",handleRoot);
   web.on("/live",sendLiveJson);
+  web.on("/hist",sendHist);
   web.on("/config",handleConfig);
   web.on("/save",HTTP_POST,handleSave);
   web.onNotFound([](){ if(apMode){ web.sendHeader("Location","/"); web.send(302,"text/plain",""); }
@@ -930,6 +1224,7 @@ void setup() {
   loadGas();
   loadMeter();
   loadTariff();
+  loadHist();
   snprintf(statusTopic,sizeof statusTopic,"%s/status",cfg.base);
   platformBeginMeter(atol(cfg.baud));
   LOG.printf("geotrio2mqtt node %s, meter RX on %s @ %s baud\n",nodeId,platformMeterPin().c_str(),cfg.baud);
@@ -939,8 +1234,8 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(cfg.ssid,cfg.wpass);
     for(int i=0;i<40 && WiFi.status()!=WL_CONNECTED;i++) delay(250);
-    // internet time (UTC), used to timestamp the saved gas reading
-    configTime(0,0,"pool.ntp.org","time.google.com");
+    // internet time, used to timestamp the saved gas reading and for the history charts
+    platformConfigTime(TIMEZONE);
   }
   if(WiFi.status()!=WL_CONNECTED) {
     LOG.println("WiFi not connected - starting AP 'geotrio2mqtt' (192.168.4.1)");
@@ -974,6 +1269,13 @@ void loop() {
     }
   }
   platformLoop();
+  // history charts: close 1-minute samples, file pending meter history, save periodically
+  histTick();
+  histApplyPending();
+  if(hMin && millis()-lastHistSave>HIST_SAVE_MIN*60000UL) {
+    lastHistSave=millis();
+    saveHist();
+  }
 #if DUMP_UNDECODED
   // every 10s, log meter RX counters
   static unsigned long lastDiag=0;

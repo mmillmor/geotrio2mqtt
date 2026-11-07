@@ -42,6 +42,9 @@ inline uint32_t platformChipId() { return ESP.getChipId(); }
 inline uint32_t platformHeapTotal() { return ESP.getFreeHeap()+ESP.getMaxFreeBlockSize(); }
 inline void platformSetHostname(const char*n) { WiFi.hostname(n); }   // before WiFi.begin()
 inline void platformLoop() { MDNS.update(); }                          // ESP8266 mDNS needs polling
+inline void platformConfigTime(const char*tz) { configTime(tz,"pool.ntp.org","time.google.com"); }
+// History kept for the web page charts (less RAM than ESP32)
+#define HIST_DAYS 62
 
 #elif defined(ESP32)
 // ===================== ESP32 (e.g. Seeed XIAO ESP32S3) =====================
@@ -73,6 +76,9 @@ inline uint32_t platformChipId() { return (uint32_t)(ESP.getEfuseMac()>>24); }
 inline uint32_t platformHeapTotal() { return ESP.getHeapSize(); }
 inline void platformSetHostname(const char*n) { WiFi.setHostname(n); }   // before WiFi.begin()
 inline void platformLoop() {}
+inline void platformConfigTime(const char*tz) { configTzTime(tz,"pool.ntp.org","time.google.com"); }
+// History kept for the web page charts
+#define HIST_DAYS 400
 
 #else
 #error "geotrio2mqtt supports ESP8266 and ESP32 boards - see platform.h"

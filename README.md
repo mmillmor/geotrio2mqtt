@@ -99,6 +99,7 @@ The ESP will also serve a small webpage with the live readings/usage. You can fi
 - Electricity and gas meter readings
 - Usage and cost for today, this week and this month
 - Tariff: unit rates and standing charges, gas calorific value and volume correction
+- History charts: the last 24 hours (electricity and gas power, per minute), daily bars for the last 31 days and monthly bars for the last 13 months, in kWh or £
 - Status: WiFi, MQTT, uptime, memory, meter data received and the scaling in use
 
 It can also be reached at `http://geotrio2mqtt.local` (or the device name set on the settings page). The last gas values are saved and shown straight away after a restart, with how long ago they changed.
@@ -110,6 +111,18 @@ Example:
 `{"elecW":168,"elecWage":"6s ago","elecK":14473.801,"elecKage":"6s ago","gasK":4236.845,"gasKage":"80s ago","rssi":-71,"ssid":"MyFi","mqtt":1,"up":2618,"heap":43296,"heapTotal":86096}`
 
 The JSON also includes `gasP` / `gasPage` (gas power now in kW, and when it was updated), `h` (usage in kWh) and `c` (cost in £), each as [[elec today, week, month], [gas today, week, month]], `t` (tariff as [[elec unit rate p/kWh, elec standing charge p/day], [gas ...]]), `cv` / `cf` (gas calorific value and volume correction), `scale` (meter scaling in use) and `rxB` / `rxF` / `rxD` (meter bytes, frames and decoded frames received). Missing values are `null`.
+
+**HISTORY CHARTS:**
+
+The web page charts use history kept on the ESP:
+- Last 24 hours: one sample a minute, kept in RAM and saved to flash every 30 minutes
+- Daily and monthly kWh and cost: recorded from the meter's "today" and "this month" figures, plus the previous days' and months' electricity figures the meter sends when the Trio II starts up (so the charts have some history straight away). The ESP32 keeps 400 days, the ESP8266 62 days, both keep 26 months.
+
+The meter doesn't send previous days or months for gas, so gas history builds up from when the ESP is installed. The charts need the time from the internet (for the UK time zone, set by `TIMEZONE` in the .ino).
+
+Flash wear isn't a concern: saving every 30 minutes uses a tiny fraction of the flash's write endurance, spread across the whole file system by LittleFS.
+
+You can also fetch the chart data from http://x.x.x.x/hist
 
 **DEBUG LOG:**
 - ESP32: the USB serial port (Serial Monitor at 115200)
