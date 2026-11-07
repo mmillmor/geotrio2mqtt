@@ -160,6 +160,10 @@ struct Config {
 } cfg;
 const char *CFG="/config.json";
 
+// History record: [elec kWh, gas kWh, elec GBP, gas GBP], NaN = no data. Defined here, before
+// the first function, because the Arduino IDE inserts its automatic function prototypes there.
+struct HVal { float v[4]; };
+
 WebServerT web(80);
 DNSServer dns;
 WiFiClient net;
@@ -236,7 +240,8 @@ double gasPowerNow() {
 // Today's samples and this year's totals are held in RAM and saved every HIST_SAVE_MIN minutes
 // and when the day / year changes. Days are local days (TIMEZONE); "day keys" are days since 1970.
 #define HNOVAL INT16_MIN
-struct HVal { float v[4]; };
+// (struct HVal is defined near the top of the file, before the first function, so the
+// Arduino IDE's automatic function prototypes can use it)
 int16_t hDayE[1440], hDayG[1440];  // today's samples, by local minute of the day
 uint16_t hToday=0;                 // day key of hDayE/G (0 = not started yet)
 bool hDayDirty=false;
