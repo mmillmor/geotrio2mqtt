@@ -3,15 +3,89 @@
  * -------------------------------------------------------------------------
  * Geo Trio II smart meter display -> MQTT
  *
- * Works on ESP8266 (e.g. NodeMCU) and ESP32 (e.g. Seeed XIAO ESP32S3) boards.
- * This file is shared by all boards; board-specific code (libraries, meter RX
- * pin, debug log port) is in platform.h and is picked automatically from the
- * board selected in Tools > Board.
+ * HARDWARE REQUIREMENTS:
+ * - Geo Trio II in-home display (with or without stock wifi module)
+ * - ESP8266 (or ESP32 etc)
+ * - Soldering iron
+ * - wire
+ * - (Optional) USB-to-serial adaptor if you're using a bare ESP board or the existing Trio II wifi module (ESP8285)
  *
- * See README.md for hardware, wiring, flashing, setup and MQTT topics.
+ * BOARD-SPECIFIC CODE:
+ * This file is shared by ESP8266 and ESP32 boards. The board-specific parts (libraries,
+ * meter RX pin, debug log port) are in platform.h, picked automatically from the board
+ * selected in Tools > Board.
+ * 
+ * SOFTWARE REQUIREMENTS:
+ *  - Arduino IDE
+ *  - ESP8266WiFi
+ *  - ESP8266WebServer
+ *  - DNSServer
+ *  - LittleFS
+ *  - ArduinoJson (>=7)
+ *  - PubSubClient (>=2.8)
+ *  (ESP32: the WiFi, WebServer and ESPmDNS libraries from the ESP32 board package are used instead)
+ *  
+ * COMPILING & FLASHING:
+ * - Install required packages in Arduino IDE (Tools > Manage Libraries)
+ * - Add ESP8266 boards repository:
+ *     - Go to: File > Preferences > Additional Boards Manager URLs
+ *     - Paste http://arduino.esp8266.com/stable/package_esp8266com_index.json
+ *     - (ESP32: paste https://espressif.github.io/arduino-esp32/package_esp32_index.json)
+ * - Tools > Board > Board Manager > ESP8266 > Install
+ * - Tools > Board > ESP8266 Boards > Then pick your particular variant
+ * - (ESP32-S3/C3 boards with native USB: Tools > USB CDC On Boot > Enabled)
+ * - Tools > Port > Select Serial port / USB (Make sure your USB serial adaptor is plugged in first)
+ * - Configure WiFi SSID & password in .ino file
+ * - Sketch > Verify/Compile
+ * - Put your ESP into flash mode (depends on board, could be automatic, could have a flash/reset button or ground GPIO0 etc)
+ * - Sketch > Upload 
  *
- * Libraries (Tools > Manage Libraries): ArduinoJson (>=7), PubSubClient (>=2.8)
- * (WiFi, web server, DNSServer, LittleFS and mDNS come with the board package.)
+ * WIRING (See images for locations):
+ * - Trio II J8 (TX) <> ESP RX (Pin D7/GPIO13 for Nodemcu)
+ *   (Seeed XIAO ESP32S3: pin D8/GPIO7 - other ESP32 pins can be set with METER_RX_PIN in platform.h)
+ * - GND <> GND
+ * - 5V <> 5V (or 3V3 <> 3V3 depending on your board)
+ * 
+ * SETUP:
+ * If no WiFi was configured in this script then the device will create a hotspot called geotrio2mqtt.
+ * Once connected to it (no password), go to 192.168.4.1 to configure your WiFi SSID/password, MQTT topic etc and then reboot.
+ * The ESP should then connect to your WiFi and start publishing MQTT messages.
+ * Note: the WiFi SSID, password and topic etc are stored in perisitent memory 
+ * meaning once set you can reflash the ESP and it will reconnect to the same WiFi without requiring setup again.
+ * The settings page also sets the device's network name (default http://geotrio2mqtt.local) and the
+ * full scale of the web page's electricity dial and gas flame.
+ *
+ * MQTT Topics:
+ * - <base>/elec/live_power_w
+ * - <base>/elec/meter
+ * - <base>/gas/meter
+ * - <base>/elec/today_kwh, week_kwh, month_kwh (and the same for gas)
+ * - <base>/elec/cost_today, cost_week, cost_month (GBP incl. standing charge, and the same for gas)
+ * - <base>/elec/unit_rate, standing_charge (GBP, from the hub's hourly price messages, and the same for gas)
+ * - <base>/gas/calorific_value, conversion_factor
+ * - <base>/status (online/LWT offline)
+ * Note: Elec topics are published every 10 seconds while gas every 2 minutes
+ * This is the frequency transmitted by the smart meter itself so can't be changed AFAIK.
+ * Also, despite gas readings being published every 2 minutes I believe they only update every 30 minutes.
+ *
+ * KNOWN ISSUES:
+ * I noticed some extremely large erroneous geotrio/gas/meter values. These seemed to occur every few hours but the previous and next values were correct.
+ * I recommend setting a filter in HomeAssistant to ignore these values. (I didn't see any erroneous values for the electricity topics but it may be worth apply the same fix to these too)
+ * e.g in mqtt.yaml
+ *   - sensor:
+        - name: "Gas Meter"
+          unique_id: gas_meter
+          state_topic: "geotrio/gas/meter"
+          unit_of_measurement: "m³"
+          device_class: gas
+          state_class: total_increasing
+          value_template: >-
+            {% set reading = value | float(none) %}
+            {% if reading is not none and 0 <= reading <= 1000000 %}
+              {{ reading }}
+            {% else %}
+              {{ this.state }}
+            {% endif %}
  * -------------------------------------------------------------------------
  */
 #include <DNSServer.h>
@@ -60,17 +134,17 @@
 struct Config {
   // Add your wifi details here
   char ssid[33] = "", wpass[65] = "";
+  
+  // MQTT broker details
+  char host[40] = "192.168.0.33", port[6] = "1883", user[32] = "", mpass[32] = "";
+  
+  // MQTT topic base e.g <geotrio>/elec/live_power_w
+  char base[48] = "geotrio";
+  
+  char baud[8] = "115200";
 
   // Device network name (letters, numbers, hyphens)
   char name[33] = HOSTNAME;
-
-  // MQTT broker details
-  char host[40] = "192.168.0.33", port[6] = "1883", user[32] = "", mpass[32] = "";
-
-  // MQTT topic base e.g <geotrio>/elec/live_power_w
-  char base[48] = "geotrio";
-
-  char baud[8] = "115200";
 
   // Web page display: full scale of the electricity dial and gas flame (kW)
   char emax[8] = STR(ELEC_DIAL_MAX_KW), gmax[8] = STR(GAS_FLAME_MAX_KW);
@@ -288,11 +362,11 @@ void pub(const char*sub,double v,bool ret,int dp=3) {
 static uint8_t fr[256];
 static size_t fl=0;
 static bool inF=false,esc=false;
-static const uint8_t TAG[4]        = {0x01, 0x09, 0x07, 0x02};   // metering cluster 0x0702
-static const uint8_t TAG_PREPAY[4] = {0x01, 0x09, 0x07, 0x05};   // prepayment cluster 0x0705
+static const uint8_t TAG[4]       = {0x01, 0x09, 0x07, 0x02};
+static const uint8_t TAG_PREPAY[4] = {0x01, 0x09, 0x07, 0x05};
+static const uint8_t DEM[4]        = {0x00, 0x04, 0x00, 0x2A};
+static const uint8_t SUM[4]        = {0x00, 0x00, 0x00, 0x25};
 static const uint8_t TAG_PRICE[4]  = {0x01, 0x09, 0x07, 0x00};   // price cluster 0x0700
-static const uint8_t DEM[4]        = {0x00, 0x04, 0x00, 0x2A};   // 0x0400 instantaneous demand
-static const uint8_t SUM[4]        = {0x00, 0x00, 0x00, 0x25};   // 0x0000 summation delivered
 static const uint8_t UOM[4]        = {0x00, 0x03, 0x00, 0x30};   // 0x0300 unit of measure
 int fseq(const uint8_t*b,size_t n,const uint8_t*p) {
   if(n<4)return -1;
@@ -721,23 +795,23 @@ void handleRoot() {
   h+="<div class=sub style='text-align:center;margin-top:24px'>"
   "<a href='https://github.com/nadnerb33/geotrio2mqtt'>"
   "https://github.com/nadnerb33/geotrio2mqtt</a></div>";
+  // dial / flame full scale from Settings, defaulting to the #defines (EMAX in W, GMAX in kW)
+  h+="<script>const EMAX="+String(kwSetting(cfg.emax,ELEC_DIAL_MAX_KW)*1000,0)
+     +",GMAX="+String(kwSetting(cfg.gmax,GAS_FLAME_MAX_KW),2)+";</script>";
   h+="<script>"
+  "function fmtUp(s){"
+  "if(s<60)return s.toLocaleString()+' sec(s)';"
+  "if(s<3600)return Math.floor(s/60).toLocaleString()+' min(s)';"
+  "if(s<86400)return Math.floor(s/3600).toLocaleString()+' hr(s)';"
+  "return Math.floor(s/86400).toLocaleString()+' day(s)';"
+  "}"
   // draw the dial arc once: 270 degree sweep, green -> red
   "(()=>{const N=36,r=78,P=a=>{a*=Math.PI/180;"
   "return (100+r*Math.cos(a)).toFixed(1)+' '+(100+r*Math.sin(a)).toFixed(1)};let s='';"
   "for(let i=0;i<N;i++){const a0=135+270*i/N,a1=Math.min(135+270*(i+1)/N+0.6,405);"
   "s+=`<path d='M${P(a0)} A${r} ${r} 0 0 1 ${P(a1)}' fill='none' stroke-width='16' "
   "stroke='hsl(${120-120*i/(N-1)},75%,48%)'/>`}"
-  "document.getElementById('arc').innerHTML=s})();";
-  // dial / flame full scale from Settings, defaulting to the #defines (EMAX in W, GMAX in kW)
-  h+="const EMAX="+String(kwSetting(cfg.emax,ELEC_DIAL_MAX_KW)*1000,0)
-     +",GMAX="+String(kwSetting(cfg.gmax,GAS_FLAME_MAX_KW),2)+";";
-  h+="function fmtUp(s){"
-  "if(s<60)return s.toLocaleString()+' sec(s)';"
-  "if(s<3600)return Math.floor(s/60).toLocaleString()+' min(s)';"
-  "if(s<86400)return Math.floor(s/3600).toLocaleString()+' hr(s)';"
-  "return Math.floor(s/86400).toLocaleString()+' day(s)';"
-  "}"
+  "document.getElementById('arc').innerHTML=s})();"
   "async function u(){try{"
   "let r=await fetch('/live');let d=await r.json();"
   "const n=v=>v==null?'---':v.toLocaleString();"
@@ -848,7 +922,8 @@ void startAP() {
 }
 void setup() {
   bootMs=millis();
-  pinMode(0,INPUT_PULLUP);   // FLASH/BOOT button -> force setup AP at runtime
+  pinMode(0,INPUT_PULLUP);
+  // FLASH button -> force setup AP at runtime
   snprintf(nodeId,sizeof nodeId,"geo%06x",(unsigned)(platformChipId()&0xFFFFFF));
   platformBeginLog();
   loadCfg();
@@ -891,7 +966,7 @@ void mqttTry() {
   }
 }
 void loop() {
-  // hold FLASH/BOOT (GPIO0) briefly at runtime to drop into the setup AP/portal
+  // hold FLASH (GPIO0) briefly at runtime to drop into the setup AP/portal
   if(digitalRead(0)==LOW) {
     delay(50);
     if(digitalRead(0)==LOW && !apMode) {
