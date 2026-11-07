@@ -1,7 +1,7 @@
 # geotrio2mqtt
 ESP firmware to read and publish meter readings from a Geo Trio II IHD.
 
-The method below was originally developed on an ESP8266 NodeMCU, and also runs on ESP32 boards (tested on a Seeed Studio XIAO ESP32S3). The code is split into two files:
+The method below was originally developed on an ESP8266 NodeMCU, and also runs on ESP32 boards. Tested on an ESP8266 NodeMCU and a Seeed Studio XIAO ESP32S3. The code is split into two files:
 - `geotrio2mqtt.ino` - shared by all boards
 - `platform.h` - the board-specific parts (libraries, meter RX pin, debug log port). The right section is picked automatically from the board you select in the Arduino IDE.
 
