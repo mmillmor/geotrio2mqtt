@@ -65,6 +65,7 @@ Note: the WiFi SSID, password and topic etc are stored in persistent memory mean
 The settings page also has:
 - **Device name** - the name the ESP gives your router, and its web address: `http://geotrio2mqtt.local` by default. Handy for reserving a fixed IP address in your router.
 - **Display** - the full scale of the electricity dial and gas flame on the web page (defaults 15 kW and 25 kW, set by `ELEC_DIAL_MAX_KW` / `GAS_FLAME_MAX_KW` in the .ino).
+- **Security** - an optional password for the settings page (default none, set by `SETTINGS_PASSWORD` in the .ino). When set, your browser asks for it when you open Settings: user name `admin` and the password. This stops others on your network changing the WiFi/MQTT settings; the live readings page stays open. Forgotten it? Set `CLEAR_SETTINGS_PASSWORD` to 1 in the .ino and upload - the password is removed when it starts (nothing else changes) - then set it back to 0 and upload again.
 
 **METER SCALING:**
 
@@ -99,7 +100,7 @@ The ESP will also serve a small webpage with the live readings/usage. You can fi
 - Electricity and gas meter readings
 - Usage and cost for today, this week and this month
 - Tariff: unit rates and standing charges, gas calorific value and volume correction
-- History: electricity and gas by Day (power per minute), Week and Month (daily bars), Year (monthly bars) or All (yearly bars), in kWh or £, with arrows to step back through earlier periods and clicking a bar to drill down
+- History: electricity and gas by Day (power per minute, or in £ the cost per hour at your current unit rates), Week and Month (daily bars), Year (monthly bars) or All (yearly bars), in kWh or £, with arrows to step back through earlier periods and clicking a bar to drill down
 - Status: WiFi, MQTT, uptime, memory, meter data received and the scaling in use
 
 It can also be reached at `http://geotrio2mqtt.local` (or the device name set on the settings page). The last gas values are saved and shown straight away after a restart, with how long ago they changed.

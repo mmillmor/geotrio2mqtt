@@ -101,6 +101,13 @@
 // and reachable as http://<name>.local
 #define HOSTNAME "geotrio2mqtt"
 
+// Optional password for the Settings page (changeable on the Settings page). Empty = no
+// password. When set, the browser asks for it: user name "admin" and this password.
+#define SETTINGS_PASSWORD ""
+// Forgotten the Settings password? Set this to 1 and upload: the password is removed at
+// start-up (nothing else changes). Then set it back to 0 and upload again.
+#define CLEAR_SETTINGS_PASSWORD 0
+
 // Meter scaling. The meter reports its own multiplier/divisor (ZCL attributes
 // 0x0301/0x0302) when the Trio II starts up; geotrio2mqtt learns them, saves them
 // and uses them from then on. These defaults are used until then.
@@ -157,6 +164,9 @@ struct Config {
 
   // Web page display: full scale of the electricity dial and gas flame (kW)
   char emax[8] = STR(ELEC_DIAL_MAX_KW), gmax[8] = STR(GAS_FLAME_MAX_KW);
+
+  // Settings page password (empty = none)
+  char apass[33] = SETTINGS_PASSWORD;
 } cfg;
 const char *CFG="/config.json";
 
@@ -517,8 +527,12 @@ void loadCfg() {
     strlcpy(cfg.name,d["name"]|cfg.name,sizeof cfg.name);
     strlcpy(cfg.emax,d["emax"]|cfg.emax,sizeof cfg.emax);
     strlcpy(cfg.gmax,d["gmax"]|cfg.gmax,sizeof cfg.gmax);
+    strlcpy(cfg.apass,d["apass"]|cfg.apass,sizeof cfg.apass);
   }
   f.close();
+#if CLEAR_SETTINGS_PASSWORD
+  if(cfg.apass[0]) { cfg.apass[0]=0; saveCfg(); LOG.println("Settings password removed"); }
+#endif
 }
 
 void saveCfg() {
@@ -534,6 +548,7 @@ void saveCfg() {
   d["name"]=cfg.name;
   d["emax"]=cfg.emax;
   d["gmax"]=cfg.gmax;
+  d["apass"]=cfg.apass;
   File f=LittleFS.open(CFG,"w");
   if(f) {
     serializeJson(d,f);
@@ -1201,7 +1216,7 @@ void handleRoot() {
   "<div style='display:flex;align-items:center;justify-content:space-between;margin:4px 0'>"
   "<a class=hn href='javascript:nv(-1)'>&lsaquo;</a><b id=ht>---</b>"
   "<a class=hn id=nx href='javascript:nv(1)'>&rsaquo;</a></div>"
-  "<svg id=hc viewBox='0 0 600 190' style='width:100%'></svg>"
+  "<svg id=hc viewBox='0 0 600 190' style='width:100%;touch-action:pan-y'></svg>"
   "<div class=sub id=hs style='margin-top:4px'></div></div>";
 
   h+="<div class=card><div class=sub>Status</div>"
@@ -1251,7 +1266,7 @@ void handleRoot() {
   "const n2=v=>v==null?'---':v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});"
   "[[cED,cEW,cEM],[cGD,cGW,cGM]].forEach((r,a)=>r.forEach((c,b)=>c.textContent=n2(d.c[a][b])));"
   "const n3=v=>v==null?'---':v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:3});"
-  "[[tER,tES],[tGR,tGS]].forEach((r,a)=>r.forEach((c,b)=>c.textContent=n3(d.t[a][b])));"
+  "[[tER,tES],[tGR,tGS]].forEach((r,a)=>r.forEach((c,b)=>c.textContent=n3(d.t[a][b])));TR=[d.t[0][0],d.t[1][0]];"
   "gcv.textContent=n(d.cv);gcf.textContent=d.cf==null?'---':d.cf.toFixed(5);"
   "let wifi=d.ssid?"
   "'WiFi: '+d.ssid+' ('+d.rssi+' dBm)'"
@@ -1268,7 +1283,7 @@ void handleRoot() {
   // TD = today's day key, U = 0 kWh / 1 GBP, HD = last /hist reply, IT = bars on screen
   "const MN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],"
   "WD=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];"
-  "let S=0,A=0,TD=0,U=0,HD=null,IT=[];"
+  "let S=0,A=0,TD=0,U=0,HD=null,IT=[],HV=null,TR=[null,null];"
   "const KD=(y,m,d)=>Date.UTC(y,m,d)/864e5,DT=k=>new Date(k*864e5),"
   "FD=(k,o)=>DT(k).toLocaleDateString(undefined,Object.assign({timeZone:'UTC'},o)),"
   "F=v=>U?'\\u00a3'+v.toFixed(2):v.toFixed(1)+' kWh';"
@@ -1295,7 +1310,7 @@ void handleRoot() {
   "try{const r=await fetch(u);HD=await r.json();TD=HD.today;HD.S=S;HD.y=y}catch(e){return}"
   "nx.style.visibility=nxOk(t)?'visible':'hidden';hdraw()}"
   // bars for week/month (days), year (months) and all (years, summed from months)
-  "function hdraw(){const d=HD;if(!d)return;if(d.S==0)return hday(d);const y=d.y;IT=[];"
+  "function hdraw(){const d=HD;HV=null;if(!d)return;if(d.S==0)return hday(d);const y=d.y;IT=[];"
   "if(d.S==1||d.S==2)d.r.forEach((v,i)=>{const k=d.from+i;"
   "IT.push({l:d.S==1?WD[i]:''+DT(k).getUTCDate(),v,go:()=>{S=0;A=k;hv()}})});"
   "if(d.S==3)d.r.forEach((v,i)=>IT.push({l:MN[i],v,go:()=>{S=2;A=KD(y,i,1);hv()}}));"
@@ -1316,22 +1331,46 @@ void handleRoot() {
   "text-anchor='${i?i<N-1?'middle':'end':'start'}' font-size='16' fill='#8a93a0'>${x.l}</text>`});"
   "hc.innerHTML=s;const T=j=>{let t=null;IT.forEach(x=>{const v=x.v[o+j];if(v!=null)t=(t||0)+v});return t==null?'---':F(t)};"
   "hs.textContent='Total: elec '+T(0)+', gas '+T(1)+' \\u2013 click a bar for more detail'}"
-  // one day: elec (W) and gas (kW x100) per minute as lines, each on its own kW scale
+  // one day: elec (W) and gas (kW x100) per minute as lines, each on its own scale: kW, or in
+  // GBP mode GBP per hour at the current unit rates (standing charges aren't included)
   // (elec max top-left in blue, gas max top-right in orange) so a boiler doesn't flatten elec
   "function hday(d){const e=d.e,g=d.g,n=1440,W=600,B=160;IT=[];"
   "if(!e.length||!e.concat(g).some(v=>v!=null)){hmsg('no minute-by-minute data for this day');hdt(d);return}"
-  "const M=(a,q)=>{let m=0.5;a.forEach(v=>{if(v!=null)m=Math.max(m,v/q)});return Math.ceil(m)},me=M(e,1000),mg=M(g,100);"
+  "if(U&&(TR[0]==null||TR[1]==null)){hmsg('waiting for the unit rates from the meter');hdt(d);return}"
+  // qe/qg: divide a sample by this to get the value shown (kW, or GBP per hour)
+  "const qe=U?1e5/TR[0]:1000,qg=U?1e4/TR[1]:100;"
+  "const M=(a,q)=>{let m=U?.05:.5;a.forEach(v=>{if(v!=null)m=Math.max(m,v/q)});return U?Math.ceil(m*10)/10:Math.ceil(m)},me=M(e,qe),mg=M(g,qg);"
+  "const ML=v=>U?'\\u00a3'+v.toFixed(2)+'/h':v+' kW';"
   "const X=i=>(i*W/(n-1)).toFixed(1);"
   "const P=(a,q,mx)=>{let s='',on=0;for(let i=0;i<n;i++){if(a[i]==null){on=0;continue}"
   "s+=(on?'L':'M')+X(i)+' '+(B-a[i]/q/mx*(B-22)).toFixed(1);on=1}return s};"
   "let s=`<line x1='0' y1='${B}' x2='${W}' y2='${B}' stroke='#2a313b'/>"
-  "<text x='2' y='15' font-size='16' fill='#6fb3ff'>${me} kW</text>"
-  "<text x='${W-2}' y='15' text-anchor='end' font-size='16' fill='#ff9f43'>${mg} kW</text>`;"
+  "<text x='2' y='15' font-size='16' fill='#6fb3ff'>${ML(me)}</text>"
+  "<text x='${W-2}' y='15' text-anchor='end' font-size='16' fill='#ff9f43'>${ML(mg)}</text>`;"
   "for(let q=0;q<=4;q++)s+=`<text x='${X(Math.min(q*360,n-1))}' y='${B+20}' "
   "text-anchor='${q?q<4?'middle':'end':'start'}' font-size='16' fill='#8a93a0'>${('0'+q*6).slice(-2)}:00</text>`;"
-  "s+=`<path d='${P(g,100,mg)}' fill='none' stroke='#ff9f43' stroke-width='1.5'/>"
-  "<path d='${P(e,1000,me)}' fill='none' stroke='#6fb3ff' stroke-width='1.5'/>`;"
-  "hc.innerHTML=s;hdt(d)}"
+  "s+=`<path d='${P(g,qg,mg)}' fill='none' stroke='#ff9f43' stroke-width='1.5'/>"
+  "<path d='${P(e,qe,me)}' fill='none' stroke='#6fb3ff' stroke-width='1.5'/>"
+  // hover marker: a guide line, a dot on each line and the values at that minute (see hmv)
+  "<line id=hqL y1='22' y2='${B}' stroke='#8a93a0' stroke-dasharray='3 3' visibility='hidden'/>"
+  "<circle id=hqG r='4' fill='#ff9f43' stroke='#000' visibility='hidden'/>"
+  "<circle id=hqE r='4' fill='#6fb3ff' stroke='#000' visibility='hidden'/>"
+  "<text id=hqT x='300' y='15' text-anchor='middle' font-size='15' fill='#cfd6df'></text>`;"
+  "HV={e,g,me,mg,qe,qg,U};hc.innerHTML=s;hdt(d)}"
+  // mouse/finger over the day chart: move the dots to that minute and show its values
+  "const hq=id=>document.getElementById(id);"
+  "function hmv(ev){if(!HV||!hq('hqL'))return;const n=1440,W=600,B=160,r=hc.getBoundingClientRect(),"
+  "i=Math.max(0,Math.min(n-1,Math.round((ev.clientX-r.left)/r.width*(n-1)))),x=i*W/(n-1);"
+  "const D=(id,v,q,mx)=>{const c=hq(id);c.setAttribute('visibility',v==null?'hidden':'visible');"
+  "if(v!=null){c.setAttribute('cx',x);c.setAttribute('cy',B-v/q/mx*(B-22))}};"
+  "const e=HV.e[i],g=HV.g[i],k=v=>v==null?'---':HV.U?'\\u00a3'+v.toFixed(3)+'/h':v.toFixed(2)+' kW';"
+  "hq('hqL').setAttribute('x1',x);hq('hqL').setAttribute('x2',x);hq('hqL').setAttribute('visibility','visible');"
+  "D('hqE',e,HV.qe,HV.me);D('hqG',g,HV.qg,HV.mg);"
+  "hq('hqT').textContent=('0'+Math.floor(i/60)).slice(-2)+':'+('0'+i%60).slice(-2)"
+  "+' \\u00b7 elec '+k(e==null?null:e/HV.qe)+' \\u00b7 gas '+k(g==null?null:g/HV.qg)}"
+  "function hlv(){if(!hq('hqL'))return;['hqL','hqE','hqG'].forEach(id=>hq(id).setAttribute('visibility','hidden'));"
+  "hq('hqT').textContent=''}"
+  "hc.addEventListener('pointermove',hmv);hc.addEventListener('pointerleave',hlv);"
   // day total under the chart
   "function hdt(d){const t=d.t||[],a=t[U?2:0],b=t[U?3:1];"
   "hs.textContent=a==null&&b==null?'':'Day total: elec '+(a==null?'---':F(a))+', gas '+(b==null?'---':F(b))}"
@@ -1343,7 +1382,15 @@ void handleRoot() {
 String field(const char*lbl,const char*name,const char*val,const char*type="text") {
   return "<label>"+String(lbl)+"</label><input name="+name+" type="+type+" value='"+String(val)+"'>";
 }
+// Settings page password: if one is set, the browser must send user "admin" + that password.
+// Returns false (and asks the browser for them) when it doesn't.
+bool settingsAuth() {
+  if(!cfg.apass[0] || web.authenticate("admin",cfg.apass)) return true;
+  web.requestAuthentication(BASIC_AUTH,"geotrio2mqtt settings");
+  return false;
+}
 void handleConfig() {
+  if(!settingsAuth()) return;
   String h=FPSTR(PAGE_HEAD);
   h+="<div class=w><h1>Settings</h1><form method=POST action=/save>";
   h+="<div class=card><div class=sub>Display</div>";
@@ -1360,10 +1407,14 @@ void handleConfig() {
   h+="<div class=row><div>"+field("User","user",cfg.user)+"</div><div>"+field("Password","mpass",cfg.mpass,"password")+"</div></div>";
   h+=field("Topic base","base",cfg.base);
   h+="</div><div class=card><div class=sub>Meter</div>"+field("Baud","baud",cfg.baud)+"</div>";
+  h+="<div class=card><div class=sub>Security</div>"+field("Settings page password","apass",cfg.apass,"password");
+  h+="<div class=sub style='margin-top:6px'>Leave empty for no password. When set, opening Settings "
+     "asks for user name <b>admin</b> and this password.</div></div>";
   h+="<button type=submit>Save &amp; reboot</button> &nbsp; <a href=/>Cancel</a></form></div>";
   web.send(200,"text/html",h);
 }
 void handleSave() {
+  if(!settingsAuth()) return;
   auto g=[&](const char*n,char*dst,size_t sz) {
     if(web.hasArg(n)) strlcpy(dst,web.arg(n).c_str(),sz);
   };
@@ -1378,6 +1429,7 @@ void handleSave() {
   g("name",cfg.name,sizeof cfg.name);
   g("emax",cfg.emax,sizeof cfg.emax);
   g("gmax",cfg.gmax,sizeof cfg.gmax);
+  g("apass",cfg.apass,sizeof cfg.apass);
   // network names may only contain a-z, 0-9 and '-', and can't start or end with '-'
   size_t o=0;
   for(size_t i=0;cfg.name[i];i++) {
