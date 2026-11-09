@@ -118,6 +118,23 @@
 #define DEFAULT_GAS_DIVISOR 1000
 // Gas today/week/month usage (sent by the meter in kWh) is divided by this.
 #define GAS_KWH_DIVISOR 1000.0
+// Decimal places in the raw cost values. These vary between installations, and the
+// Trio II's own format attribute (0x0500) can't be relied on, so geotrio2mqtt works
+// them out by comparing "cost today" with usage x unit rate + standing charge, then
+// saves the result. These defaults are used until then.
+#define DEFAULT_ELEC_COST_DP 5
+#define DEFAULT_GAS_COST_DP 5
+// A decimal-places setting matches if cost is within this factor of the expected figure
+// (must stay below 3.16 so that only one setting can match).
+#define COST_MATCH_FACTOR 2.5
+// Once checked, the setting only changes if it disagrees for this long (minutes), so
+// usage and cost resetting at slightly different times around midnight can't change it.
+#define COST_DP_CONFIRM_MIN 30
+// Fixed decimal places for raw costs, overriding the automatic check: "" = automatic,
+// or "0" to "7". These are the DEFAULTS - they can also be changed on the device's
+// Settings page (Meter section) without re-uploading.
+#define ELEC_COST_DP_OVERRIDE ""
+#define GAS_COST_DP_OVERRIDE ""
 
 // Web page "Energy now" display (kW). These are the DEFAULTS - they can also be
 // changed on the device's Settings page (Display section) without re-uploading.
@@ -165,6 +182,9 @@ struct Config {
   // Web page display: full scale of the electricity dial and gas flame (kW)
   char emax[8] = STR(ELEC_DIAL_MAX_KW), gmax[8] = STR(GAS_FLAME_MAX_KW);
 
+  // Fixed decimal places for raw costs (empty = work them out automatically)
+  char ecdp[3] = ELEC_COST_DP_OVERRIDE, gcdp[3] = GAS_COST_DP_OVERRIDE;
+
   // Settings page password (empty = none)
   char apass[33] = SETTINGS_PASSWORD;
 } cfg;
@@ -187,8 +207,12 @@ volatile double vElecW=NAN, vElecK=NAN, vGasK=NAN;
 double vHist[2][3]={{NAN,NAN,NAN},{NAN,NAN,NAN}};
 // cost in GBP incl. standing charge: same layout as vHist
 double vCost[2][3]={{NAN,NAN,NAN},{NAN,NAN,NAN}};
-// decimal places of cost values per fuel; updated from attr 0x0500 when the meter sends it
-uint8_t costDp[2]={5,2};
+// decimal places of raw cost values per fuel, verified against the tariff by checkCostDp()
+uint8_t costDp[2]={DEFAULT_ELEC_COST_DP,DEFAULT_GAS_COST_DP};
+bool costChecked[2]={false,false};    // true = costDp has been verified against the tariff
+int8_t costDpCand[2]={-1,-1};         // a different value the tariff check currently suggests
+unsigned long costDpSince[2]={0,0};   // when that suggestion started
+int16_t costFmt[2]={-1,-1};           // raw attr 0x0500 as last sent by the meter (diagnostics only)
 unsigned long tElecW=0, tElecK=0, tGasK=0, bootMs=0, lastMqtt=0, lastWifi=0;
 
 // Meter scaling per fuel ([0]=elec, [1]=gas): value = raw * mult / div
@@ -527,6 +551,8 @@ void loadCfg() {
     strlcpy(cfg.name,d["name"]|cfg.name,sizeof cfg.name);
     strlcpy(cfg.emax,d["emax"]|cfg.emax,sizeof cfg.emax);
     strlcpy(cfg.gmax,d["gmax"]|cfg.gmax,sizeof cfg.gmax);
+    strlcpy(cfg.ecdp,d["ecdp"]|cfg.ecdp,sizeof cfg.ecdp);
+    strlcpy(cfg.gcdp,d["gcdp"]|cfg.gcdp,sizeof cfg.gcdp);
     strlcpy(cfg.apass,d["apass"]|cfg.apass,sizeof cfg.apass);
   }
   f.close();
@@ -548,6 +574,8 @@ void saveCfg() {
   d["name"]=cfg.name;
   d["emax"]=cfg.emax;
   d["gmax"]=cfg.gmax;
+  d["ecdp"]=cfg.ecdp;
+  d["gcdp"]=cfg.gcdp;
   d["apass"]=cfg.apass;
   File f=LittleFS.open(CFG,"w");
   if(f) {
@@ -563,6 +591,8 @@ void saveMeter() {
     d["m"][i]=mMult[i];
     d["d"][i]=mDiv[i];
     d["l"][i]=mLearned[i];
+    d["cd"][i]=costDp[i];
+    d["cc"][i]=costChecked[i];
   }
   File f=LittleFS.open(METERF,"w");
   if(f) {
@@ -582,6 +612,11 @@ void loadMeter() {
         mMult[i]=m;
         mDiv[i]=v;
         mLearned[i]=d["l"][i]|false;
+      }
+      int cd=d["cd"][i]|-1;
+      if(cd>=0 && cd<=7) {
+        costDp[i]=cd;
+        costChecked[i]=d["cc"][i]|false;
       }
     }
   }
@@ -707,6 +742,52 @@ bool readUAttr(const uint8_t*f,size_t n,uint16_t id,uint64_t&out) {
   return false;
 }
 
+// Decimal places fixed on the Settings page for this fuel, or -1 for automatic
+// (an empty or invalid setting counts as automatic).
+int costOverride(int fi) {
+  const char*s=fi?cfg.gcdp:cfg.ecdp;
+  return (s[0]>='0' && s[0]<='7' && !s[1]) ? s[0]-'0' : -1;
+}
+
+// Work out the decimal places of a fuel's raw costs by finding the power of ten that
+// brings "cost today" close to usage today x unit rate + one day's standing charge.
+// Does nothing until usage and tariff are known, or if no setting is a clear match.
+void checkCostDp(int fi,uint64_t raw) {
+  double want=vHist[fi][0]*vRate[fi]+vStanding[fi];
+  if(raw==0 || isnan(want) || want<=0) return;
+  int dp=-1;
+  for(int i=0;i<=7;i++) {
+    double r=(double)raw/pow(10,i)/want;
+    if(r>=1.0/COST_MATCH_FACTOR && r<=COST_MATCH_FACTOR) {
+      dp=i;
+      break;
+    }
+  }
+  if(dp<0) return;
+  if(dp==costDp[fi]) {
+    costDpCand[fi]=-1;
+    if(!costChecked[fi]) {
+      costChecked[fi]=true;
+      saveMeter();
+    }
+    return;
+  }
+  if(costChecked[fi]) {               // already verified: change only on sustained disagreement
+    if(costDpCand[fi]!=dp) {
+      costDpCand[fi]=dp;
+      costDpSince[fi]=millis();
+      return;
+    }
+    if(millis()-costDpSince[fi]<COST_DP_CONFIRM_MIN*60000UL) return;
+  }
+  LOG.printf("%s cost decimal places: %u -> %d (checked against tariff)\n",
+    fi?"gas":"elec",(unsigned)costDp[fi],dp);
+  costDp[fi]=dp;
+  costChecked[fi]=true;
+  costDpCand[fi]=-1;
+  saveMeter();
+}
+
 // Prepayment cluster (0x0705) frames: cost of energy used today / this week / this month
 // (attrs 0x051C / 0x0530 / 0x0540), including standing charge.
 void handlePrepay(const uint8_t*f,size_t n) {
@@ -716,11 +797,17 @@ void handlePrepay(const uint8_t*f,size_t n) {
   if(ch!=1&&ch!=2) return;
   rxDecoded++;
   int fi=ch-1;
-  // attr 0x0500 (HistoricalCostConsumptionFormatting, bitmap8): low 3 bits = decimal places
-  static const uint8_t FMT[4]={0x00,0x05,0x00,0x18};
-  int p=fseq(f,n,FMT);
-  if(p>=0&&(size_t)(p+5)<=n) costDp[fi]=f[p+4]&0x07;
-  double div=pow(10,costDp[fi]);
+  // attr 0x0500 (HistoricalCostConsumptionFormatting) doesn't match the real decimal
+  // places on some installations, so it is only recorded for diagnostics
+  uint8_t fmt;
+  if(readAttr8(f,n,0x0500,fmt) && fmt!=costFmt[fi]) {
+    costFmt[fi]=fmt;
+    LOG.printf("%s cost format attr 0x0500 = 0x%02X\n",fi?"gas":"elec",fmt);
+  }
+  uint64_t rawToday;
+  if(readUAttr(f,n,0x051C,rawToday)) checkCostDp(fi,rawToday);
+  int ov=costOverride(fi);
+  double div=pow(10,ov>=0?ov:costDp[fi]);
   static const uint16_t CID[3]={0x051C,0x0530,0x0540};
   static const char*CNM[3]={"cost_today","cost_week","cost_month"};
   char sub[32];
@@ -1004,6 +1091,9 @@ String scaleStr(int fi) {
   String s=(fi?"gas ":"elec ");
   if(mMult[fi]!=1) s+="x"+String(mMult[fi])+" ";
   s+="/"+String(mDiv[fi])+(mLearned[fi]?" (from meter)":" (default)");
+  int ov=costOverride(fi);
+  s+=", cost "+String(ov>=0?ov:(int)costDp[fi])+" dp"+(ov>=0?" (manual)":costChecked[fi]?" (checked)":" (default)");
+  if(costFmt[fi]>=0) s+=" [0x0500=0x"+String((int)costFmt[fi],HEX)+"]";
   return s;
 }
 const char PAGE_HEAD[] PROGMEM =
@@ -1406,7 +1496,11 @@ void handleConfig() {
   h+="<div class=row><div>"+field("Host","host",cfg.host)+"</div><div>"+field("Port","port",cfg.port)+"</div></div>";
   h+="<div class=row><div>"+field("User","user",cfg.user)+"</div><div>"+field("Password","mpass",cfg.mpass,"password")+"</div></div>";
   h+=field("Topic base","base",cfg.base);
-  h+="</div><div class=card><div class=sub>Meter</div>"+field("Baud","baud",cfg.baud)+"</div>";
+  h+="</div><div class=card><div class=sub>Meter</div>"+field("Baud","baud",cfg.baud);
+  h+="<div class=row><div>"+field("Electricity cost decimal places","ecdp",cfg.ecdp,"number min=0 max=7")+"</div>"
+     "<div>"+field("Gas cost decimal places","gcdp",cfg.gcdp,"number min=0 max=7")+"</div></div>";
+  h+="<div class=sub style='margin-top:6px'>Leave empty to work these out automatically from your tariff. "
+     "Only set them if costs are out by a factor of 10, 100 or 1000.</div></div>";
   h+="<div class=card><div class=sub>Security</div>"+field("Settings page password","apass",cfg.apass,"password");
   h+="<div class=sub style='margin-top:6px'>Leave empty for no password. When set, opening Settings "
      "asks for user name <b>admin</b> and this password.</div></div>";
@@ -1429,6 +1523,8 @@ void handleSave() {
   g("name",cfg.name,sizeof cfg.name);
   g("emax",cfg.emax,sizeof cfg.emax);
   g("gmax",cfg.gmax,sizeof cfg.gmax);
+  g("ecdp",cfg.ecdp,sizeof cfg.ecdp);
+  g("gcdp",cfg.gcdp,sizeof cfg.gcdp);
   g("apass",cfg.apass,sizeof cfg.apass);
   // network names may only contain a-z, 0-9 and '-', and can't start or end with '-'
   size_t o=0;

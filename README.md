@@ -73,6 +73,10 @@ Meters report readings in different units (e.g. one meter sends live power in wa
 
 If your readings are 10x (or 100x) out, power-cycle the Trio II once while the ESP is running. The scaling in use is shown in the Status line of the web page.
 
+Cost values also differ in their number of decimal places between installations. geotrio2mqtt works this out by comparing cost today with usage today x unit rate + standing charge, so costs can be out by a power of ten until the first tariff message arrives (about an hour after first start). The result is saved, and shown in the Status line as "checked". Until then it uses `DEFAULT_ELEC_COST_DP` / `DEFAULT_GAS_COST_DP` from the .ino.
+
+If costs are still out by a factor of 10, 100 or 1000, enter the correct number of decimal places under Meter on the Settings page (defaults set by `ELEC_COST_DP_OVERRIDE` / `GAS_COST_DP_OVERRIDE` in the .ino). Each cost divides by 10 for every extra place. Leave them empty for automatic. A value set here shows in the Status line as "manual".
+
 **MQTT Topics:**
 - geotrio/elec/live_power_w
 - geotrio/elec/meter
